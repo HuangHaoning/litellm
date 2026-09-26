@@ -196,6 +196,51 @@ _NO_ASEARCH_NAMED: Final[_AsearchNamedParams] = {}
 _NO_ACOMPLETION_NAMED: Final[_AcompletionNamedParams] = {}
 
 
+def _extract_search_result_content(response: object) -> str:
+    """从委派端点的 Messages 返回里提取搜索结果文本。
+
+    组1 原生 Anthropic 端点经服务端工具真实搜索后，content 里带
+    ``web_search_tool_result`` 内容块（其 content 是 text 块列表）。
+    找不到该块返回空串——由调用方决定降级。
+    """
+    content: Final = getattr(response, "content", None)
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "web_search_tool_result":
+            continue
+        block_content = block.get("content")
+        if isinstance(block_content, str):
+            parts.append(block_content)
+        elif isinstance(block_content, list):
+            for item in block_content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+    return "\n".join(parts)
+
+
+def _inject_search_result_and_strip_tool(kwargs: dict, result_text: str) -> dict:
+    """把搜索结果注入消息上下文，并从 tools 剥离 web 搜索工具。
+
+    原地修改传入 kwargs 并返回同一个 dict——``async_pre_request_hook``
+    的返回契约就是「以返回的 dict 为准」，见官方同文件其它 hook 的写法。
+    """
+    messages: Final = kwargs.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("WebSearchInterception: missing messages for delegation")
+    kwargs["messages"] = [
+        *messages,
+        {"role": "user", "content": f"实时搜索结果（按来源如实引用，不编造）：\n{result_text}"},
+    ]
+    tools = kwargs.get("tools")
+    if isinstance(tools, list):
+        kwargs["tools"] = [t for t in tools if not is_web_search_tool(t)]
+    return kwargs
+
+
 class WebSearchInterceptionLogger(CustomLogger):
     """
     CustomLogger that intercepts WebSearch tool calls for models that don't
