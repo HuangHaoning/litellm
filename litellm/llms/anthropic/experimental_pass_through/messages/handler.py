@@ -294,6 +294,7 @@ async def anthropic_messages(
     # overrides and (b) avoid duplicate-keyword conflicts when splatting `kwargs`
     # into call sites that already pass these as named arguments.
     tools = request_kwargs.pop("tools", tools)
+    messages = request_kwargs.pop("messages", messages)
     stream = request_kwargs.pop("stream", stream)
     metadata = request_kwargs.pop("metadata", metadata)
     stop_sequences = request_kwargs.pop("stop_sequences", stop_sequences)
@@ -382,8 +383,11 @@ async def anthropic_messages(
         client=client,
         custom_llm_provider=custom_llm_provider,
         # messages were already empty-content-block sanitized at the top of this
-        # function and are NOT reassigned before this dispatch, so the handler
-        # can skip its (otherwise redundant) second full-messages scan. Passed
+        # function and are normally NOT reassigned before this dispatch, so the
+        # handler can skip its (otherwise redundant) second full-messages scan.
+        # A pre-request hook MAY override messages (e.g. websearch_interception
+        # delegation injecting search results) -- the pop above adopts it, and
+        # the override is plain text, so presanitized still holds. Passed
         # explicitly (not via **kwargs) so it only affects this direct
         # dispatch -- interceptor / sync entry points still sanitize.
         _litellm_messages_presanitized=True,

@@ -267,6 +267,33 @@ def _inject_search_result_and_strip_tool(kwargs: dict, result_text: str) -> dict
     tools = kwargs.get("tools")
     if isinstance(tools, list):
         kwargs["tools"] = [t for t in tools if not is_web_search_tool(t)]
+
+    # 裁撤残留强制 tool_choice：委派分支提前 return，绕过了官方
+    # _sync_forced_tool_choice（那是"改指 litellm_web_search"的语义，委派
+    # 场景两个名字都不在剩余工具里，改指一样被上游拒）。Claude Code 独立
+    # 搜索请求必带 {"type":"tool","name":"web_search"}，剥掉工具后若不裁撤，
+    # 主请求上游 400 "Tool 'web_search' not found in provided tools"。
+    # 置 None（而非删键）：pass-through 对 tool_choice 做 pop 回退，删键会
+    # 重新启用其本地原始强制值；置 None 让 pop 拿到中性值、litellm 序列化
+    # 时整体省略 tool_choice。
+    remaining_tools: Final = kwargs.get("tools")
+    forced_tool_choice: Final = kwargs.get("tool_choice")
+    if (
+        isinstance(forced_tool_choice, dict)
+        and forced_tool_choice.get("type") == "tool"
+        and isinstance(forced_tool_choice.get("name"), str)
+        and isinstance(remaining_tools, list)
+        and not any(
+            (
+                t.get("function", {}).get("name")
+                if t.get("type") == "function" and isinstance(t.get("function"), dict)
+                else t.get("name")
+            )
+            == forced_tool_choice["name"]
+            for t in remaining_tools
+        )
+    ):
+        kwargs["tool_choice"] = None
     return kwargs
 
 
@@ -345,6 +372,13 @@ class WebSearchInterceptionLogger(CustomLogger):
             An AnthropicMessagesResponse dict if short-circuited, or None to
             continue normal processing.
         """
+        # 递归防呆：委派子请求带 _websearch_skip → 绝不短路。否则用户把委派
+        # 端点 provider 加进 enabled_providers 时，委派子请求会被本方法合成
+        # 响应，绕过真实端点的服务端搜索（默认 bedrock 配置安全，此为核心
+        # 防呆缺口）。
+        if kwargs is not None and kwargs.get("_websearch_skip"):
+            return None
+
         if not tools:
             return None
 
@@ -658,7 +692,7 @@ class WebSearchInterceptionLogger(CustomLogger):
         # 提取为空时注入函数不追加消息（只剥工具），避免引导模型引用不存在的来源
         return _inject_search_result_and_strip_tool(kwargs, result_text=result_text)
 
-    async def _should_delegate(self, kwargs: dict) -> bool:
+    def _should_delegate(self, kwargs: dict) -> bool:
         """委派判断（纯逻辑，便于单测）：有搜索工具 + 声明了 websearch_endpoint。
 
         递归标记 ``_websearch_skip`` 的早退在 hook 顶部处理（显式
@@ -696,10 +730,15 @@ class WebSearchInterceptionLogger(CustomLogger):
 
         # 委派优先：声明了 websearch_endpoint 且有搜索工具的请求，
         # 直接子调用委派端点真搜，不进官方 provider 白名单与工具转换。
-        if await self._should_delegate(kwargs):
-            delegate_kwargs: Final = await self._delegate_to_endpoint(kwargs, kwargs.get("websearch_endpoint"))
-            kwargs.update(delegate_kwargs)
-            return kwargs
+        if self._should_delegate(kwargs):
+            endpoint = kwargs.get("websearch_endpoint")
+            # 真实链路里 messages 是 hook 的位置参数、不在 kwargs——
+            # experimental pass-through 的 _execute_pre_request_hooks 构造
+            # request_kwargs 时不放回 messages，塞回供委派/注入函数读取。
+            # 该链路 pop 列表已同步补 messages：采纳注入结果、防 partial
+            # 撞键（messages 同时以命名参数与 **kwargs 传参必 TypeError）。
+            kwargs["messages"] = messages
+            return await self._delegate_to_endpoint(kwargs, endpoint)
 
         # Check if this request is for an enabled provider
         custom_llm_provider: Final = kwargs.get("litellm_params", {}).get("custom_llm_provider", "")
