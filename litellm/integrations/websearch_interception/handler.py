@@ -244,7 +244,7 @@ def _extract_search_result_content(response: object) -> str:
                             if p
                         )
                     )
-    return "\n".join(parts)
+    return "\n".join(p for p in parts if p)
 
 
 def _inject_search_result_and_strip_tool(kwargs: dict, result_text: str) -> dict:
@@ -629,6 +629,47 @@ class WebSearchInterceptionLogger(CustomLogger):
             return tool_choice
         return {**tool_choice, "name": LITELLM_WEB_SEARCH_TOOL_NAME}
 
+    async def _delegate_to_endpoint(self, kwargs: dict, endpoint: str) -> dict:
+        """把搜索请求委派给支持搜索的端点（组1 原生 Anthropic），结果回注。
+
+        走 ``anthropic_messages.acreate``（fork 的真实入口；``litellm.messages``
+        在本 fork 不存在）—— 委派端点是 /v1/messages 透传，上游（OpenCode Go）
+        会真实执行服务端 web_search 工具。
+        子请求带 ``_websearch_skip`` 标记，杜绝再次触发本 hook 造成递归。
+        """
+        messages: Final = kwargs.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("WebSearchInterception: missing messages for delegation")
+        search_tools: Final = [t for t in kwargs.get("tools", []) if is_web_search_tool(t)]
+        tool_choice: Final = {"type": "tool", "name": "web_search"}
+        try:
+            resp = await anthropic_messages.acreate(
+                model=endpoint,
+                messages=messages,
+                tools=search_tools,
+                tool_choice=tool_choice,
+                max_tokens=2048,
+                _websearch_skip=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            verbose_logger.warning("WebSearchInterception: Delegation to %s failed (%s); degrading to tool-strip", endpoint, e)
+            return _inject_search_result_and_strip_tool(kwargs, result_text="")
+        result_text: Final = _extract_search_result_content(resp)
+        # 提取为空时注入函数不追加消息（只剥工具），避免引导模型引用不存在的来源
+        return _inject_search_result_and_strip_tool(kwargs, result_text=result_text)
+
+    async def _should_delegate(self, kwargs: dict) -> bool:
+        """委派判断（纯逻辑，便于单测）：有搜索工具 + 声明了 websearch_endpoint。
+
+        递归标记 ``_websearch_skip`` 的早退在 hook 顶部处理（显式
+        ``return None``），不在这里短路——否则带标记的委派子请求会落回
+        官方工具转换，把原生 ``web_search_20250305`` 改写、破坏组1 透传。
+        """
+        tools = kwargs.get("tools")
+        if not isinstance(tools, list) or not any(is_web_search_tool(t) for t in tools):
+            return False
+        return isinstance(kwargs.get("websearch_endpoint"), str) and bool(kwargs.get("websearch_endpoint"))
+
     async def async_pre_request_hook(self, model: str, messages: list[dict], kwargs: dict) -> dict | None:
         """
         Pre-request hook to convert native web search tools to LiteLLM standard.
@@ -644,6 +685,22 @@ class WebSearchInterceptionLogger(CustomLogger):
         Returns:
             Modified kwargs dict with converted tools, or None if no modifications needed
         """
+        # 递归早退：委派子请求带 _websearch_skip → 不做任何处理。
+        # 必须是 hook 顶部的显式 return None，而不是在 _should_delegate 里
+        # 短路——否则子请求会落回官方工具转换，把原生 web_search_20250305
+        # 改写，破坏对组1 端点的原生透传（test_hook_recursion_guard 用
+        # litellm_params 钉死此契约：bedrock 在白名单内，唯有显式早退才
+        # 返回 None）。
+        if kwargs.get("_websearch_skip"):
+            return None
+
+        # 委派优先：声明了 websearch_endpoint 且有搜索工具的请求，
+        # 直接子调用委派端点真搜，不进官方 provider 白名单与工具转换。
+        if await self._should_delegate(kwargs):
+            delegate_kwargs: Final = await self._delegate_to_endpoint(kwargs, kwargs.get("websearch_endpoint"))
+            kwargs.update(delegate_kwargs)
+            return kwargs
+
         # Check if this request is for an enabled provider
         custom_llm_provider: Final = kwargs.get("litellm_params", {}).get("custom_llm_provider", "")
 
