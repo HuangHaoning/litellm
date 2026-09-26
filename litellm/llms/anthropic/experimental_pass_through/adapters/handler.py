@@ -348,6 +348,15 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         if custom_llm_provider != "openai":
             return
 
+        # Honour the /v1/messages opt-out here as well. Deployments that set
+        # `litellm.use_chat_completions_url_for_anthropic_messages` asked to be
+        # routed through chat/completions (see
+        # experimental_pass_through/messages/handler.py::_should_route_to_responses_api);
+        # rewriting the model to `responses/...` below would undo that and send
+        # the request to an endpoint the upstream may not implement at all.
+        if litellm.use_chat_completions_url_for_anthropic_messages:
+            return
+
         if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
             return
 
