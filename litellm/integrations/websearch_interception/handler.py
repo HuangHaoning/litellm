@@ -200,15 +200,25 @@ def _extract_search_result_content(response: object) -> str:
     """从委派端点的 Messages 返回里提取搜索结果文本。
 
     组1 原生 Anthropic 端点经服务端工具真实搜索后，content 里带
-    ``web_search_tool_result`` 内容块（其 content 是 text 块列表）。
-    找不到该块返回空串——由调用方决定降级。
+    ``web_search_tool_result`` 内容块。兼容两种响应形态：
+
+    - 对象形态：``response.content`` 属性
+    - dict 形态：fork 的 /v1/messages 入口返回 ``AnthropicMessagesResponse``
+      （TypedDict），``content`` 是普通键
+
+    块内结果按 ``web_search_result`` 项（url/title/snippet）拼接，
+    也兼容 ``{"type": "text"}`` 文本块形态。找不到该块返回空串——
+    由调用方决定降级。
     """
-    content: Final = getattr(response, "content", None)
+    if isinstance(response, Mapping):
+        content = response.get("content")
+    else:
+        content = getattr(response, "content", None)
     if not isinstance(content, list):
         return ""
     parts: list[str] = []
     for block in content:
-        if not isinstance(block, dict):
+        if not isinstance(block, Mapping):
             continue
         if block.get("type") != "web_search_tool_result":
             continue
@@ -217,8 +227,23 @@ def _extract_search_result_content(response: object) -> str:
             parts.append(block_content)
         elif isinstance(block_content, list):
             for item in block_content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
+                if not isinstance(item, Mapping):
+                    continue
+                item_type = item.get("type")
+                if item_type == "text":
+                    parts.append(str(item.get("text") or ""))
+                elif item_type == "web_search_result":
+                    parts.append(
+                        "\n".join(
+                            p
+                            for p in (
+                                str(item.get("title") or ""),
+                                str(item.get("url") or ""),
+                                str(item.get("snippet") or ""),
+                            )
+                            if p
+                        )
+                    )
     return "\n".join(parts)
 
 
@@ -227,14 +252,18 @@ def _inject_search_result_and_strip_tool(kwargs: dict, result_text: str) -> dict
 
     原地修改传入 kwargs 并返回同一个 dict——``async_pre_request_hook``
     的返回契约就是「以返回的 dict 为准」，见官方同文件其它 hook 的写法。
+
+    ``result_text`` 为空时不追加 user 消息、只剥工具——避免引导模型
+    引用并不存在的来源；是否注入由调用方决定。
     """
     messages: Final = kwargs.get("messages")
     if not isinstance(messages, list):
         raise ValueError("WebSearchInterception: missing messages for delegation")
-    kwargs["messages"] = [
-        *messages,
-        {"role": "user", "content": f"实时搜索结果（按来源如实引用，不编造）：\n{result_text}"},
-    ]
+    if result_text:
+        kwargs["messages"] = [
+            *messages,
+            {"role": "user", "content": f"实时搜索结果（按来源如实引用，不编造）：\n{result_text}"},
+        ]
     tools = kwargs.get("tools")
     if isinstance(tools, list):
         kwargs["tools"] = [t for t in tools if not is_web_search_tool(t)]
