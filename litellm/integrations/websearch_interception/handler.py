@@ -35,6 +35,7 @@ from litellm.litellm_core_utils.agentic_loop_settings import (
     validated_max_agentic_loops,
 )
 from litellm.llms.base_llm.search.transformation import SearchResponse
+from litellm.secret_managers.main import get_secret
 from litellm.types.integrations.custom_logger import (
     CHAT_COMPLETION_AGENTIC_SURFACE,
     RESPONSES_AGENTIC_SURFACE,
@@ -295,6 +296,71 @@ def _inject_search_result_and_strip_tool(kwargs: dict, result_text: str) -> dict
     ):
         kwargs["tool_choice"] = None
     return kwargs
+
+
+# 委派端点真实调用参数的键：model 是部署的 litellm_params.model（带 provider
+# 前缀，如 anthropic/deepseek-flash），api_base / api_key / extra_headers 是
+# 部署级连接信息，裸代理名直连时全都拿不到。
+_ENDPOINT_PARAM_KEYS: Final = ("model", "api_base", "api_key", "extra_headers")
+
+
+def _pick_endpoint_params(endpoint: str, deployments: Sequence[Mapping[str, object]]) -> dict[str, object] | None:
+    """从路由器部署列表里按 model_name 挑出 endpoint 的真实调用参数。
+
+    返回 {"model","api_base","api_key","extra_headers"}（api_key 为原始值，
+    由调用方经 get_secret 解析）；挑不到返回 None。纯函数，便于单测。
+
+    挑第一个 ``model_name == endpoint`` 且 ``litellm_params.model`` 非空的
+    部署；``api_base``/``api_key``/``extra_headers`` 可缺省（取到 None）。
+    """
+    for deployment in deployments:
+        if deployment.get("model_name") != endpoint:
+            continue
+        litellm_params: Final = deployment.get("litellm_params")
+        if not isinstance(litellm_params, Mapping):
+            continue
+        model: Final = litellm_params.get("model")
+        if not isinstance(model, str) or not model:
+            continue
+        return {key: litellm_params.get(key) for key in _ENDPOINT_PARAM_KEYS}
+    return None
+
+
+def _resolve_endpoint_deployment(endpoint: str) -> dict[str, object] | None:
+    """薄包装：延迟导入 llm_router → get_model_list(model_name=endpoint) → _pick_endpoint_params。
+
+    无 router / 导入失败 / 取不到 → None（调用方降级）。
+    """
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except ImportError:
+        verbose_logger.debug(
+            "WebSearchInterception: Could not import llm_router from proxy_server; cannot resolve endpoint %s",
+            endpoint,
+        )
+        return None
+    if llm_router is None:
+        return None
+    try:
+        deployments: Final = llm_router.get_model_list(model_name=endpoint)
+    except Exception as e:  # noqa: BLE001
+        verbose_logger.warning("WebSearchInterception: get_model_list(%s) failed: %s", endpoint, e)
+        return None
+    if not deployments:
+        return None
+    return _pick_endpoint_params(endpoint, deployments)
+
+
+def _resolve_api_key(api_key: object) -> object:
+    """解析带 ``os.environ/`` 前缀的 api_key；普通字符串原样返回。
+
+    实测 ``get_secret`` 对不含 scheme 前缀的字符串返回 **None**（不是原值），
+    故不能无条件调用——否则部署里写明文 key 时会被解析成 None 丢掉。
+    带前缀判断的写法与 ``proxy_server.py`` / ``s3_v2.py`` 既有实现一致。
+    """
+    if isinstance(api_key, str) and api_key.startswith("os.environ/"):
+        return get_secret(api_key) or api_key
+    return api_key
 
 
 class WebSearchInterceptionLogger(CustomLogger):
@@ -670,21 +736,46 @@ class WebSearchInterceptionLogger(CustomLogger):
         在本 fork 不存在）—— 委派端点是 /v1/messages 透传，上游（OpenCode Go）
         会真实执行服务端 web_search 工具。
         子请求带 ``_websearch_skip`` 标记，杜绝再次触发本 hook 造成递归。
+
+        ``websearch_endpoint`` 是**代理模型名**（如 ``deepseek-flash``），而
+        ``anthropic_messages.acreate`` 是 SDK 直连入口、**不走路由器**，无法
+        从裸代理名推断 provider——直接传会报 "LLM Provider NOT provided"。
+        故先经路由器把端点解析成部署真实参数（``litellm_params.model`` 如
+        ``anthropic/deepseek-flash`` + ``api_base``/``api_key``/``extra_headers``）
+        再调用；解析不到按 spec §6 降级（剥工具放行、不注入假结果）。
         """
         messages: Final = kwargs.get("messages")
         if not isinstance(messages, list):
             raise ValueError("WebSearchInterception: missing messages for delegation")
+
+        params: Final = _resolve_endpoint_deployment(endpoint)
+        if params is None or not params.get("model"):
+            verbose_logger.warning(
+                "WebSearchInterception: Could not resolve endpoint %s; degrading to tool-strip", endpoint
+            )
+            return _inject_search_result_and_strip_tool(kwargs, result_text="")
+
         search_tools: Final = [t for t in kwargs.get("tools", []) if is_web_search_tool(t)]
         tool_choice: Final = {"type": "tool", "name": "web_search"}
-        try:
-            resp = await anthropic_messages.acreate(
-                model=endpoint,
-                messages=messages,
-                tools=search_tools,
-                tool_choice=tool_choice,
-                max_tokens=2048,
-                _websearch_skip=True,
+        # 只放非 None 的可选参数：显式传 None 会覆盖 litellm 默认（如 api_base
+        # 被置 None 就丢掉 provider 默认 base url），故用 dict 组装后 ** 展开。
+        call_params: Final[dict[str, object]] = {
+            "model": params["model"],
+            "messages": messages,
+            "tools": search_tools,
+            "tool_choice": tool_choice,
+            "max_tokens": 2048,
+            "_websearch_skip": True,
+        }
+        for optional_key in ("api_base", "api_key", "extra_headers"):
+            optional_value: Final = params.get(optional_key)
+            if optional_value is None:
+                continue
+            call_params[optional_key] = (
+                _resolve_api_key(optional_value) if optional_key == "api_key" else optional_value
             )
+        try:
+            resp = await anthropic_messages.acreate(**call_params)  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001
             verbose_logger.warning("WebSearchInterception: Delegation to %s failed (%s); degrading to tool-strip", endpoint, e)
             return _inject_search_result_and_strip_tool(kwargs, result_text="")
