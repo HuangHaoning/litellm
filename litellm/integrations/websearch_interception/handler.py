@@ -199,6 +199,28 @@ _NO_ASEARCH_NAMED: Final[_AsearchNamedParams] = {}
 _NO_ACOMPLETION_NAMED: Final[_AcompletionNamedParams] = {}
 
 
+def _resolve_delegation_max_tokens(client_max_tokens: object, floor: int) -> int:
+    """委派子调用的 max_tokens：``max(客户端值, 下限)``。
+
+    主请求的 max_tokens 是**答案**的预算，不是**搜索**的预算。Claude Code
+    的独立搜索请求常带很小的值（如 256），而委派端点要先 thinking、再发
+    搜索工具调用、再读完结果写正文——用客户端值会直接截断在 thinking 里
+    （实测 2048 就已不够），搜索白跑、主模型什么都拿不到。下限保证预算够
+    跑完搜索；客户端要更大预算时则尊重客户端。
+
+    客户端值缺失或不可用时返回 ``floor``，绝不返回 None（None 会让子调用
+    退回 litellm 默认，正是本函数要消除的不确定性）。
+
+    走 ``validated_positive_int`` 而非 ``_as_whole_number``：后者是该模块的
+    私有名，跨模块引用会越过封装边界；捕获异常即得到「不可用」语义。
+    """
+    try:
+        client_value: Final = validated_positive_int(client_max_tokens, field="max_tokens")
+    except (TypeError, ValueError):
+        return floor
+    return max(client_value, floor)
+
+
 def _extract_search_result_content(response: object) -> str:
     """从委派端点的 Messages 返回里提取可注入的搜索结果文本。
 
@@ -823,12 +845,15 @@ class WebSearchInterceptionLogger(CustomLogger):
         tool_choice: Final = {"type": "tool", "name": "web_search"}
         # 只放非 None 的可选参数：显式传 None 会覆盖 litellm 默认（如 api_base
         # 被置 None 就丢掉 provider 默认 base url），故用 dict 组装后 ** 展开。
+        delegation_max_tokens: Final = _resolve_delegation_max_tokens(
+            kwargs.get("max_tokens"), self.delegation_max_tokens_floor
+        )
         call_params: Final[dict[str, object]] = {
             "model": params["model"],
             "messages": messages,
             "tools": search_tools,
             "tool_choice": tool_choice,
-            "max_tokens": 2048,
+            "max_tokens": delegation_max_tokens,
             "_websearch_skip": True,
         }
         for optional_key in ("api_base", "api_key", "extra_headers"):
@@ -843,6 +868,20 @@ class WebSearchInterceptionLogger(CustomLogger):
         except Exception as e:  # noqa: BLE001
             verbose_logger.warning("WebSearchInterception: Delegation to %s failed (%s); degrading to tool-strip", endpoint, e)
             return _inject_search_result_and_strip_tool(kwargs, result_text="")
+        # 下限被撑爆时子调用会截断在 thinking 里：没有搜索块也没有答案，
+        # 注入为空 → 搜索静默失效。必须留下可诊断的痕迹，否则「8192 够不够」
+        # 永远无法证伪（spec §8 风险 1）。
+        stop_reason: Final = (
+            resp.get("stop_reason") if isinstance(resp, Mapping) else getattr(resp, "stop_reason", None)
+        )
+        if stop_reason == "max_tokens":
+            verbose_logger.warning(
+                "WebSearchInterception: Delegation to %s hit max_tokens=%s (stop_reason=max_tokens); "
+                "the search result is likely truncated. Raise "
+                "websearch_interception_params.delegation_max_tokens_floor if this recurs.",
+                endpoint,
+                delegation_max_tokens,
+            )
         result_text: Final = _extract_search_result_content(resp)
         # 提取为空时注入函数不追加消息（只剥工具），避免引导模型引用不存在的来源
         return _inject_search_result_and_strip_tool(kwargs, result_text=result_text)
