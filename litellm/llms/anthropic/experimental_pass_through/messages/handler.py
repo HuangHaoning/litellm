@@ -276,9 +276,12 @@ async def anthropic_messages(
     original_stream: Final = stream or kwargs.get("_websearch_interception_converted_stream", False)
 
     # Execute pre-request hooks to allow CustomLoggers to modify request.
-    # tool_choice is forwarded explicitly (it is a named param, not in kwargs)
-    # so hooks that rename tools — e.g. websearch_interception converting
-    # web_search -> litellm_web_search — can keep a forced tool_choice in sync.
+    # tool_choice and max_tokens are forwarded explicitly (both are named
+    # params, not in kwargs) so hooks that rename tools -- e.g.
+    # websearch_interception converting web_search -> litellm_web_search --
+    # can keep a forced tool_choice in sync, and hooks that sub-call another
+    # endpoint -- e.g. websearch_interception delegation -- can size that
+    # sub-call from the client's budget.
     request_kwargs: Final = await _execute_pre_request_hooks(
         model=model,
         messages=messages,
@@ -286,6 +289,7 @@ async def anthropic_messages(
         stream=stream,
         custom_llm_provider=custom_llm_provider,
         tool_choice=tool_choice,
+        max_tokens=max_tokens,
         **kwargs,
     )
 
@@ -302,6 +306,11 @@ async def anthropic_messages(
     temperature = request_kwargs.pop("temperature", temperature)
     thinking = request_kwargs.pop("thinking", thinking)
     tool_choice = request_kwargs.pop("tool_choice", tool_choice)
+    # Pop max_tokens too: the hook may have overridden it, and the dispatch
+    # below already passes max_tokens as a named argument -- leaving the key
+    # in kwargs raises "functools.partial() got multiple values for keyword
+    # argument 'max_tokens'".
+    max_tokens = request_kwargs.pop("max_tokens", max_tokens)
     top_k = request_kwargs.pop("top_k", top_k)
     top_p = request_kwargs.pop("top_p", top_p)
     # Propagate the provider derived inside pre-request hooks, if not already set.
