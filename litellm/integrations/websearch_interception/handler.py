@@ -200,18 +200,27 @@ _NO_ACOMPLETION_NAMED: Final[_AcompletionNamedParams] = {}
 
 
 def _extract_search_result_content(response: object) -> str:
-    """从委派端点的 Messages 返回里提取搜索结果文本。
+    """从委派端点的 Messages 返回里提取可注入的搜索结果文本。
 
-    组1 原生 Anthropic 端点经服务端工具真实搜索后，content 里带
-    ``web_search_tool_result`` 内容块。兼容两种响应形态：
+    真机形状（2026-10-05 dump）：``content`` 是 thinking / server_tool_use /
+    ``web_search_tool_result`` / ``text`` 混排的块列表。**答案在独立的顶层
+    ``text`` 块里**，不在 ``web_search_tool_result`` 内；结果项键为
+    encrypted_content / page_age / title / type / url —— **没有 snippet**
+    （上游恒不返回）。
 
-    - 对象形态：``response.content`` 属性
-    - dict 形态：fork 的 /v1/messages 入口返回 ``AnthropicMessagesResponse``
-      （TypedDict），``content`` 是普通键
+    规则（顺序即优先级）：
 
-    块内结果按 ``web_search_result`` 项（url/title/snippet）拼接，
-    也兼容 ``{"type": "text"}`` 文本块形态。找不到该块返回空串——
-    由调用方决定降级。
+    1. 没有 ``web_search_tool_result`` 块 → 返回空串。这是「上游真的搜了」
+       的唯一证据：委派子调用虽强制 ``tool_choice`` 指向 web_search，上游
+       仍可无视它、不搜就答。若无条件采纳顶层 ``text``，那段没有检索依据
+       的答案会被贴上「实时搜索结果」标签喂给主模型——正是本功能要消灭的
+       编造行为，却由我们自己引入且更难发现。
+    2. 有搜索块 → 取顶层 ``text`` 块作为答案主体（按出现顺序）。
+    3. 追加**去重后**的来源列表（title + url），供主模型核查引用。
+    4. ``encrypted_content`` 一律丢弃——它是加密正文，注入等于污染上下文。
+
+    兼容对象形态（``response.content``）与 dict 形态（fork 的 /v1/messages
+    返回 TypedDict）。``content`` 缺失/非 list 时返回空串，不抛异常。
     """
     if isinstance(response, Mapping):
         content = response.get("content")
@@ -219,35 +228,61 @@ def _extract_search_result_content(response: object) -> str:
         content = getattr(response, "content", None)
     if not isinstance(content, list):
         return ""
-    parts: list[str] = []
+
+    # 规则 1：先确认上游真的搜了。没有搜索块就没有可注入的依据。
+    has_search_block: Final = any(
+        isinstance(block, Mapping) and block.get("type") == "web_search_tool_result" for block in content
+    )
+    if not has_search_block:
+        return ""
+
+    answers: list[str] = []
+    sources: list[str] = []
+    seen_sources: set[str] = set()
+
     for block in content:
         if not isinstance(block, Mapping):
             continue
-        if block.get("type") != "web_search_tool_result":
+        block_type: Final = block.get("type")
+
+        # 规则 2：顶层 text 块就是答案。
+        if block_type == "text":
+            text: Final = block.get("text")
+            if isinstance(text, str) and text.strip():
+                answers.append(text)
             continue
-        block_content = block.get("content")
+
+        if block_type != "web_search_tool_result":
+            continue
+
+        # 规则 3：结果项只贡献来源，不贡献答案。
+        block_content: Final = block.get("content")
         if isinstance(block_content, str):
-            parts.append(block_content)
-        elif isinstance(block_content, list):
-            for item in block_content:
-                if not isinstance(item, Mapping):
-                    continue
-                item_type = item.get("type")
-                if item_type == "text":
-                    parts.append(str(item.get("text") or ""))
-                elif item_type == "web_search_result":
-                    parts.append(
-                        "\n".join(
-                            p
-                            for p in (
-                                str(item.get("title") or ""),
-                                str(item.get("url") or ""),
-                                str(item.get("snippet") or ""),
-                            )
-                            if p
-                        )
-                    )
-    return "\n".join(p for p in parts if p)
+            if block_content.strip():
+                sources.append(block_content)
+            continue
+        if not isinstance(block_content, list):
+            continue
+        for item in block_content:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("type") != "web_search_result":
+                continue
+            source: Final = "\n".join(
+                part
+                for part in (
+                    str(item.get("title") or ""),
+                    str(item.get("url") or ""),
+                )
+                if part
+            )
+            # 同一 URL 可能在多个结果块里重复出现，只保留一份。
+            if not source or source in seen_sources:
+                continue
+            seen_sources.add(source)
+            sources.append(source)
+
+    return "\n".join(part for part in (*answers, *sources) if part)
 
 
 def _inject_search_result_and_strip_tool(kwargs: dict, result_text: str) -> dict:
