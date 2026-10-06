@@ -45,15 +45,30 @@ def _as_whole_number(value: object) -> int | None:
     return None
 
 
+DEFAULT_DELEGATION_MAX_TOKENS_FLOOR: Final = 8192
+
+
+def validated_positive_int(value: object, field: str) -> int:
+    """
+    Return ``value`` as an int >= 1, or raise naming ``field``.
+
+    Shares ``_as_whole_number`` with the loop ceiling so both settings
+    accept exactly the same spellings (ints, whole floats, numeric
+    strings from ``os.environ/``) and reject the same ones (``bool``,
+    fractional floats, non-numeric strings).
+    """
+    number: Final = _as_whole_number(value)
+    if number is None:
+        raise TypeError(f"{field} must be an integer, got {value!r}")
+    if number < 1:
+        raise ValueError(f"{field} must be at least 1, got {number}")
+    return number
+
+
 def validated_max_agentic_loops(max_agentic_loops: object, field: str) -> int | None:
     """
     Return ``max_agentic_loops`` as an int, or raise naming ``field``.
     """
     if max_agentic_loops is None:
         return None
-    ceiling: Final = _as_whole_number(max_agentic_loops)
-    if ceiling is None:
-        raise TypeError(f"{field} must be an integer, got {max_agentic_loops!r}")
-    if ceiling < 1:
-        raise ValueError(f"{field} must be at least 1, got {ceiling}")
-    return ceiling
+    return validated_positive_int(max_agentic_loops, field)

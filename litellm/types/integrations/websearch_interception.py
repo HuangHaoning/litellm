@@ -37,6 +37,7 @@ class WebSearchInterceptionConfig(TypedDict, total=False):
             enabled_providers: ["bedrock"]
             search_tool_name: "my-perplexity-search"
             max_agentic_loops: 5
+            delegation_max_tokens_floor: 8192
     """
 
     enabled_providers: list[str]
@@ -47,3 +48,7 @@ class WebSearchInterceptionConfig(TypedDict, total=False):
 
     max_agentic_loops: ReadOnly[int | None]
     """How many follow-up model calls one intercepted request may chain. If None, LiteLLM's default of 3 applies."""
+
+    delegation_max_tokens_floor: ReadOnly[int | None]
+    """Floor for the delegation sub-call's max_tokens: the sub-call uses
+    max(client max_tokens, this). If None, the default of 8192 applies."""

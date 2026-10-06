@@ -32,7 +32,9 @@ from litellm.integrations.websearch_interception.transformation import (
     WebSearchTransformation,
 )
 from litellm.litellm_core_utils.agentic_loop_settings import (
+    DEFAULT_DELEGATION_MAX_TOKENS_FLOOR,
     validated_max_agentic_loops,
+    validated_positive_int,
 )
 from litellm.llms.base_llm.search.transformation import SearchResponse
 from litellm.secret_managers.main import get_secret
@@ -380,6 +382,7 @@ class WebSearchInterceptionLogger(CustomLogger):
         enabled_providers: list[LlmProviders | str] | None = None,
         search_tool_name: str | None = None,
         max_agentic_loops: int | None = None,
+        delegation_max_tokens_floor: int | None = None,
     ):
         """
         Args:
@@ -392,6 +395,9 @@ class WebSearchInterceptionLogger(CustomLogger):
             max_agentic_loops: How many follow-up model calls one intercepted request
                               may chain before the loop is refused and the turn ends.
                               If None, LiteLLM's default of 3 applies.
+            delegation_max_tokens_floor: Floor for the delegation sub-call's
+                              max_tokens. If None, DEFAULT_DELEGATION_MAX_TOKENS_FLOOR
+                              (8192) applies.
         """
         super().__init__()
         # Convert enum values to strings for comparison
@@ -401,6 +407,9 @@ class WebSearchInterceptionLogger(CustomLogger):
             self.enabled_providers = [p.value if isinstance(p, LlmProviders) else p for p in enabled_providers]
         self.search_tool_name = search_tool_name
         self.max_agentic_loops = self._validated_max_agentic_loops(max_agentic_loops)
+        self.delegation_max_tokens_floor = self._validated_delegation_max_tokens_floor(
+            delegation_max_tokens_floor
+        )
         self._request_has_websearch = False  # Track if current request has web search
 
     @staticmethod
@@ -409,6 +418,23 @@ class WebSearchInterceptionLogger(CustomLogger):
         Reject loop ceilings the agentic loop cannot honor, at config load time.
         """
         return validated_max_agentic_loops(max_agentic_loops, field="websearch_interception_params.max_agentic_loops")
+
+    @staticmethod
+    def _validated_delegation_max_tokens_floor(delegation_max_tokens_floor: object) -> int:
+        """
+        Reject delegation token floors the sub-call cannot honor, at config load time.
+
+        Unlike the loop ceiling this is never None: an unset floor still has
+        to produce a number, or the sub-call would fall back to whatever the
+        client asked for -- the exact 2048-style truncation this floor exists
+        to prevent.
+        """
+        if delegation_max_tokens_floor is None:
+            return DEFAULT_DELEGATION_MAX_TOKENS_FLOOR
+        return validated_positive_int(
+            delegation_max_tokens_floor,
+            field="websearch_interception_params.delegation_max_tokens_floor",
+        )
 
     async def try_short_circuit_search(
         self,
@@ -674,6 +700,7 @@ class WebSearchInterceptionLogger(CustomLogger):
                     enabled_providers: ["bedrock"]
                     search_tool_name: "my-perplexity-search"
                     max_agentic_loops: 5
+                    delegation_max_tokens_floor: 8192
 
             Usage:
                 config = litellm_settings.get("websearch_interception_params", {})
@@ -683,6 +710,7 @@ class WebSearchInterceptionLogger(CustomLogger):
         enabled_providers_str: Final = config.get("enabled_providers", None)
         search_tool_name: Final = config.get("search_tool_name", None)
         max_agentic_loops: Final = config.get("max_agentic_loops", None)
+        delegation_max_tokens_floor: Final = config.get("delegation_max_tokens_floor", None)
 
         # Convert string provider names to LlmProviders enum values
         enabled_providers: list[LlmProviders | str] | None = None
@@ -701,6 +729,7 @@ class WebSearchInterceptionLogger(CustomLogger):
             enabled_providers=enabled_providers,
             search_tool_name=search_tool_name,
             max_agentic_loops=max_agentic_loops,
+            delegation_max_tokens_floor=delegation_max_tokens_floor,
         )
 
     @staticmethod
