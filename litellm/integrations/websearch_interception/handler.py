@@ -883,7 +883,23 @@ class WebSearchInterceptionLogger(CustomLogger):
                 delegation_max_tokens,
             )
         result_text: Final = _extract_search_result_content(resp)
-        # 提取为空时注入函数不追加消息（只剥工具），避免引导模型引用不存在的来源
+        # 提取为空 = 上游没返回 ``web_search_tool_result`` 块（提取器规则 1）：
+        # 即使我们强制了 tool_choice，上游仍可无视它、不搜就答。此时注入函数
+        # 只剥工具、不追加消息（规则 4，避免引导模型引用不存在的来源），主模型
+        # 拿到的是**无检索依据**的答案。这是全功能唯一完全静默的降级路径——
+        # 不告警的话，网关日志里它与「成功委派」无法区分（spec §8 要求「降级了」
+        # 与「正常」必须可区分），用户也无从知道搜索其实没发生。
+        # 与上面的截断告警是两种不同诊断（「预算太小」vs「上游没搜」），二者
+        # 可同时成立（截断在 thinking 里就是既 stop_reason=max_tokens 又无搜索块），
+        # 故不互斥、都记录，但措辞刻意不同以便区分。
+        if not result_text:
+            verbose_logger.warning(
+                "WebSearchInterception: Delegation to %s returned no web_search_tool_result block "
+                "(stop_reason=%s); the upstream did not perform a search, degrading to tool-strip "
+                "with no grounded result injected.",
+                endpoint,
+                stop_reason,
+            )
         return _inject_search_result_and_strip_tool(kwargs, result_text=result_text)
 
     def _should_delegate(self, kwargs: dict) -> bool:
