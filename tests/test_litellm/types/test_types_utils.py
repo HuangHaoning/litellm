@@ -10,6 +10,21 @@ def test_rust_is_a_known_litellm_param():
     assert "rust" in all_litellm_params
 
 
+def test_websearch_endpoint_is_not_swept_into_the_provider_body():
+    """The websearch_interception fork reads `websearch_endpoint` from a
+    deployment's litellm_params, which the router splats into request kwargs.
+    An unrecognized top-level key is swept into `extra_body` and sent upstream,
+    where a strict backend rejects the whole request (400 "Extra inputs are not
+    permitted"), so a deployment that declares it must stay callable for plain
+    non-search requests."""
+    from litellm.utils import get_non_default_completion_params, get_optional_params
+
+    non_default_params = get_non_default_completion_params({"websearch_endpoint": "deepseek-flash"})
+    optional_params = get_optional_params(model="glm-5.3", custom_llm_provider="openai", **non_default_params)
+
+    assert "websearch_endpoint" not in optional_params.get("extra_body", {})
+
+
 def test_hidden_params_response_ms():
     hidden_params = HiddenParams()
     setattr(hidden_params, "_response_ms", 100)

@@ -3780,6 +3780,12 @@ all_litellm_params = (
         "adaptive_router_default_model",
         "quality_router_config",
         "quality_router_default_model",
+        # websearch_interception deployment config, read from litellm_params by
+        # its pre-request hook. Listed for the same reason as the bedrock batch
+        # fields above: it sits on a deployment that also serves plain non-search
+        # requests, so leaking it into extra_body makes a strict backend reject
+        # every request to that deployment.
+        "websearch_endpoint",
     ]
     + list(StandardCallbackDynamicParams.__annotations__.keys())
     + list(CustomPricingLiteLLMParams.model_fields.keys())
