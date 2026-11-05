@@ -8,9 +8,10 @@ server-side using litellm router's search tools.
 
 import asyncio
 import math
+import re
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, TypedDict, TypeVar, cast
 
 from typing_extensions import Never, ReadOnly
 
@@ -91,6 +92,25 @@ WEBSEARCH_NATIVE_BLOCKS_METADATA_KEY: Final = "websearch_native_blocks"
 _RESPONSE_CONTENT_FIELD: Final = "content"
 
 _ResponseT: Final = TypeVar("_ResponseT")
+
+_URL_PATTERN: Final = re.compile(r"https?://[^\s<>\"')\]]+")
+_URL_TRAILING_PUNCTUATION: Final = ".,;:!?)]}'\"]。，；：！？）】」』"
+
+_DELEGATION_LINK_INSTRUCTION: Final = (
+    "请在最终答案正文中用完整 URL 标明引用的来源。"
+    "只能使用本次搜索结果给出的链接，不得编造或推测链接。"
+)
+
+_DELEGATION_UNGROUNDED_NOTE: Final = (
+    "委派端点未返回带来源链接的答案。"
+    "以下仅为本次搜索的来源链接。"
+    "请只依据这些链接作答，不得编造内容。"
+)
+
+_SEARCH_RESULT_PREFIX: Final = (
+    "实时搜索结果（按来源如实引用，不编造；"
+    "如客户端支持 WebFetch，可用它核验来源链接）："
+)
 
 
 class _PlanMetadataView(TypedDict):
@@ -221,45 +241,42 @@ def _resolve_delegation_max_tokens(client_max_tokens: object, floor: int) -> int
     return max(client_value, floor)
 
 
-def _extract_search_result_content(response: object) -> str:
-    """从委派端点的 Messages 返回里提取可注入的搜索结果文本。
+class _SearchExtraction(NamedTuple):
+    has_search_block: bool
+    answer_text: str
+    sources: tuple[str, ...]
+    source_urls: tuple[str, ...]
 
-    真机形状（2026-10-05 dump）：``content`` 是 thinking / server_tool_use /
-    ``web_search_tool_result`` / ``text`` 混排的块列表。**答案在独立的顶层
-    ``text`` 块里**，不在 ``web_search_tool_result`` 内；结果项键为
-    encrypted_content / page_age / title / type / url —— **没有 snippet**
-    （上游恒不返回）。
 
-    规则（顺序即优先级）：
+def _normalize_url(url: str) -> str:
+    return url.strip().rstrip(_URL_TRAILING_PUNCTUATION).rstrip("/")
 
-    1. 没有 ``web_search_tool_result`` 块 → 返回空串。这是「上游真的搜了」
-       的唯一证据：委派子调用虽强制 ``tool_choice`` 指向 web_search，上游
-       仍可无视它、不搜就答。若无条件采纳顶层 ``text``，那段没有检索依据
-       的答案会被贴上「实时搜索结果」标签喂给主模型——正是本功能要消灭的
-       编造行为，却由我们自己引入且更难发现。
-    2. 有搜索块 → 取顶层 ``text`` 块作为答案主体（按出现顺序）。
-    3. 追加**去重后**的来源列表（title + url），供主模型核查引用。
-    4. ``encrypted_content`` 一律丢弃——它是加密正文，注入等于污染上下文。
 
-    兼容对象形态（``response.content``）与 dict 形态（fork 的 /v1/messages
-    返回 TypedDict）。``content`` 缺失/非 list 时返回空串，不抛异常。
-    """
+def _answer_cites_source(answer_text: str, source_urls: Sequence[str]) -> bool:
+    cited: Final = {_normalize_url(match.group(0)) for match in _URL_PATTERN.finditer(answer_text)}
+    if not cited:
+        return False
+    known: Final = {_normalize_url(url) for url in source_urls if url}
+    return not cited.isdisjoint(known)
+
+
+def _collect_search_extraction(response: object) -> _SearchExtraction:
     if isinstance(response, Mapping):
         content = response.get("content")
     else:
         content = getattr(response, "content", None)
     if not isinstance(content, list):
-        return ""
+        return _SearchExtraction(False, "", (), ())
 
-    # 规则 1：先确认上游真的搜了。没有搜索块就没有可注入的依据。
     has_search_block: Final = any(
         isinstance(block, Mapping) and block.get("type") == "web_search_tool_result" for block in content
     )
     if not has_search_block:
-        return ""
+        return _SearchExtraction(False, "", (), ())
 
     answers: list[str] = []
     sources: list[str] = []
+    source_urls: list[str] = []
     seen_sources: set[str] = set()
 
     for block in content:
@@ -267,7 +284,6 @@ def _extract_search_result_content(response: object) -> str:
             continue
         block_type: Final = block.get("type")
 
-        # 规则 2：顶层 text 块就是答案。
         if block_type == "text":
             text: Final = block.get("text")
             if isinstance(text, str) and text.strip():
@@ -277,7 +293,6 @@ def _extract_search_result_content(response: object) -> str:
         if block_type != "web_search_tool_result":
             continue
 
-        # 规则 3：结果项只贡献来源，不贡献答案。
         block_content: Final = block.get("content")
         if isinstance(block_content, str):
             if block_content.strip():
@@ -290,21 +305,55 @@ def _extract_search_result_content(response: object) -> str:
                 continue
             if item.get("type") != "web_search_result":
                 continue
+            item_url: Final = item.get("url")
+            if isinstance(item_url, str) and item_url.strip():
+                source_urls.append(item_url)
             source: Final = "\n".join(
                 part
                 for part in (
                     str(item.get("title") or ""),
-                    str(item.get("url") or ""),
+                    str(item_url or ""),
                 )
                 if part
             )
-            # 同一 URL 可能在多个结果块里重复出现，只保留一份。
             if not source or source in seen_sources:
                 continue
             seen_sources.add(source)
             sources.append(source)
 
-    return "\n".join(part for part in (*answers, *sources) if part)
+    return _SearchExtraction(
+        has_search_block=True,
+        answer_text="\n".join(answers),
+        sources=tuple(sources),
+        source_urls=tuple(source_urls),
+    )
+
+
+def _render_search_extraction(extraction: _SearchExtraction) -> str:
+    if not extraction.has_search_block:
+        return ""
+    if _answer_cites_source(extraction.answer_text, extraction.source_urls):
+        return "\n".join(part for part in (extraction.answer_text, *extraction.sources) if part)
+    if extraction.sources:
+        return "\n".join((_DELEGATION_UNGROUNDED_NOTE, *extraction.sources))
+    return ""
+
+
+def _extract_search_result_content(response: object) -> str:
+    """从委派端点的 Messages 返回里提取可注入的搜索结果文本。
+
+    规则（顺序即优先级）：
+
+    1. 没有 ``web_search_tool_result`` 块 → 返回空串。上游可以无视强制的
+       ``tool_choice``、不搜就答；那段答案没有检索依据，不得注入。
+    2. 有搜索块，但答案正文不含本次来源中的 URL → 只注入来源列表与提示。
+       不采纳无链接的答案，避免主模型引用不可核验的内容。
+    3. 有搜索块，且答案正文引用了来源 URL → 注入答案，再追加去重来源。
+    4. ``encrypted_content`` 一律丢弃。
+
+    兼容对象形态（``response.content``）与 dict 形态。
+    """
+    return _render_search_extraction(_collect_search_extraction(response))
 
 
 def _inject_search_result_and_strip_tool(kwargs: dict, result_text: str) -> dict:
@@ -322,7 +371,7 @@ def _inject_search_result_and_strip_tool(kwargs: dict, result_text: str) -> dict
     if result_text:
         kwargs["messages"] = [
             *messages,
-            {"role": "user", "content": f"实时搜索结果（按来源如实引用，不编造）：\n{result_text}"},
+            {"role": "user", "content": f"{_SEARCH_RESULT_PREFIX}\n{result_text}"},
         ]
     tools = kwargs.get("tools")
     if isinstance(tools, list):
@@ -848,9 +897,13 @@ class WebSearchInterceptionLogger(CustomLogger):
         delegation_max_tokens: Final = _resolve_delegation_max_tokens(
             kwargs.get("max_tokens"), self.delegation_max_tokens_floor
         )
+        delegation_messages: Final = [
+            *messages,
+            {"role": "user", "content": _DELEGATION_LINK_INSTRUCTION},
+        ]
         call_params: Final[dict[str, object]] = {
             "model": params["model"],
-            "messages": messages,
+            "messages": delegation_messages,
             "tools": search_tools,
             "tool_choice": tool_choice,
             "max_tokens": delegation_max_tokens,
@@ -882,7 +935,17 @@ class WebSearchInterceptionLogger(CustomLogger):
                 endpoint,
                 delegation_max_tokens,
             )
-        result_text: Final = _extract_search_result_content(resp)
+        extraction: Final = _collect_search_extraction(resp)
+        if extraction.has_search_block and not _answer_cites_source(
+            extraction.answer_text, extraction.source_urls
+        ):
+            verbose_logger.warning(
+                "WebSearchInterception: Delegation to %s returned an answer without a cited source link "
+                "(stop_reason=%s); injecting the source list only.",
+                endpoint,
+                stop_reason,
+            )
+        result_text: Final = _render_search_extraction(extraction)
         # 提取为空 = 上游没返回 ``web_search_tool_result`` 块（提取器规则 1）：
         # 即使我们强制了 tool_choice，上游仍可无视它、不搜就答。此时注入函数
         # 只剥工具、不追加消息（规则 4，避免引导模型引用不存在的来源），主模型
